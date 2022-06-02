@@ -1,57 +1,91 @@
 use bytes::Bytes;
-use mini_redis::{Connection, Frame};
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
-use tokio::net::{TcpListener, TcpStream};
+use mini_redis::client;
+use tokio::sync::{mpsc, oneshot};
+
+/// Multiple different commands are multiplexed over a single channel.
+#[derive(Debug)]
+enum Command {
+    Get {
+        key: String,
+        resp: Responder<Option<Bytes>>,
+    },
+    Set {
+        key: String,
+        val: Bytes,
+        resp: Responder<()>,
+    },
+}
+
+/// Provided by the requester and used by the manager task to send the command
+/// response back to the requester.
+type Responder<T> = oneshot::Sender<mini_redis::Result<T>>;
 
 #[tokio::main]
 async fn main() {
-    let listener = TcpListener::bind("127.0.0.1:6379").await.unwrap();
+    let (tx, mut rx) = mpsc::channel(32);
+    // Clone a `tx` handle for the second f
+    let tx2 = tx.clone();
 
-    println!("Listening");
+    let manager = tokio::spawn(async move {
+        // Open a connection to the mini-redis address.
+        let mut client = client::connect("127.0.0.1:6379").await.unwrap();
 
-    let db = Arc::new(Mutex::new(HashMap::new()));
-
-    loop {
-        // The second item contains the ip and port of the new connection.
-        let (socket, _) = listener.accept().await.unwrap();
-
-        let db = db.clone();
-
-        // A new task is spawned for each inbound socket.  The socket is
-        // moved to the new task and processed there.
-        tokio::spawn(async move {
-            process(socket, db).await;
-        });
-    }
-}
-
-async fn process(socket: TcpStream, db: Db) {
-    use mini_redis::Command::{self, Get, Set};
-
-    // Connection, provided by `mini-redis`, handles parsing frames from
-    // the socket
-    let mut connection = Connection::new(socket);
-
-    while let Some(frame) = connection.read_frame().await.unwrap() {
-        let response = match Command::from_frame(frame).unwrap() {
-            Set(cmd) => {
-                let mut db = db.lock().unwrap();
-                db.insert(cmd.key().to_string(), cmd.value().clone());
-                Frame::Simple("OK".to_string())
-            }
-            Get(cmd) => {
-                let db = db.lock().unwrap();
-                if let Some(value) = db.get(cmd.key()) {
-                    Frame::Bulk(value.clone())
-                } else {
-                    Frame::Null
+        while let Some(cmd) = rx.recv().await {
+            match cmd {
+                Command::Get { key, resp } => {
+                    let res = client.get(&key).await;
+                    // Ignore errors
+                    let _ = resp.send(res);
+                }
+                Command::Set { key, val, resp } => {
+                    let res = client.set(&key, val).await;
+                    // Ignore errors
+                    let _ = resp.send(res);
                 }
             }
-            cmd => panic!("unimplemented {:?}", cmd),
+        }
+    });
+
+    // Spawn two tasks, one setting a value and other querying for key that was
+    // set.
+    let t1 = tokio::spawn(async move {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let cmd = Command::Get {
+            key: "foo".to_string(),
+            resp: resp_tx,
         };
 
-        // Write the response to the client
-        connection.write_frame(&response).await.unwrap();
-    }
+        // Send the GET request
+        if tx.send(cmd).await.is_err() {
+            eprintln!("connection task shutdown");
+            return;
+        }
+
+        // Await the response
+        let res = resp_rx.await;
+        println!("GOT (Get) = {:?}", res);
+    });
+
+    let t2 = tokio::spawn(async move {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let cmd = Command::Set {
+            key: "foo".to_string(),
+            val: "bar".into(),
+            resp: resp_tx,
+        };
+
+        // Send the SET request
+        if tx2.send(cmd).await.is_err() {
+            eprintln!("connection task shutdown");
+            return;
+        }
+
+        // Await the response
+        let res = resp_rx.await;
+        println!("GOT (Set) = {:?}", res);
+    });
+
+    t1.await.unwrap();
+    t2.await.unwrap();
+    manager.await.unwrap();
 }
